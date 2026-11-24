@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import select
 import sys
+import termios
+import tty
 
 FORMACIONES = {
     "4-3-3": {
@@ -117,6 +120,60 @@ MAPA_VISUAL = {
 }
 
 
+class SalidaUsuario(Exception):
+    """Se lanza cuando el usuario aprieta Esc o interrumpe la entrada."""
+
+
+def _leer_tecla():
+    """Lee una tecla o secuencia de escape desde la consola."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                rest = sys.stdin.read(2)
+                return ch + rest
+            return "ESC"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def leer_o_salir(prompt):
+    """Lee una línea por teclado y sale al instante si se presiona Esc o Ctrl+C."""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    chars = []
+    while True:
+        try:
+            tecla = _leer_tecla()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            raise SalidaUsuario()
+
+        if tecla == "ESC":
+            print("\nSaliste con Esc.")
+            raise SalidaUsuario()
+        elif tecla == "\x03":  # Ctrl+C en modo raw
+            print()
+            raise SalidaUsuario()
+        elif tecla in ("\r", "\n"):
+            print()
+            return "".join(chars).strip()
+        elif tecla in ("\x7f", "\b"):  # Backspace
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+        elif len(tecla) == 1 and tecla.isprintable():
+            chars.append(tecla)
+            sys.stdout.write(tecla)
+            sys.stdout.flush()
+
+
 def repartir_linea(jugadores, cantidad):
     """Toma `cantidad` jugadores y devuelve una lista."""
     tomados = jugadores[:cantidad]
@@ -137,7 +194,9 @@ def obtener_roles_linea(formacion, codigo_linea, cantidad):
 def guardar_json(equipo, formacion, jugadores):
     """Guarda la alineación completa en un archivo JSON."""
     nombre_sugerido = f"{equipo.strip().lower().replace(' ', '_')}_{formacion}.json"
-    ruta = input(f"Nombre del archivo [{nombre_sugerido}]: ").strip()
+    ruta = leer_o_salir(
+        f"Nombre del archivo [{nombre_sugerido}] (Esc para cancelar): "
+    )
     if not ruta:
         ruta = nombre_sugerido
     if not ruta.endswith(".json"):
@@ -155,12 +214,13 @@ def guardar_json(equipo, formacion, jugadores):
 
 def modo_interactivo(equipo_inicial=None, formacion_inicial=None):
     """Pide equipo, formación, titulares, suplentes y opción de guardar en JSON."""
-    print("\n=== MODO INTERACTIVO: ARMADOR DE ALINEACIÓN ===\n")
+    print("\n=== MODO INTERACTIVO: ARMADOR DE ALINEACIÓN ===")
+    print("(Apretá Esc en cualquier momento para salir)\n")
 
     if equipo_inicial:
         equipo = equipo_inicial
     else:
-        entrada_equipo = input("Nombre del equipo [Mi Equipo]: ").strip()
+        entrada_equipo = leer_o_salir("Nombre del equipo [Mi Equipo]: ")
         equipo = entrada_equipo if entrada_equipo else "Mi Equipo"
 
     opciones_formacion = list(FORMACIONES.keys())
@@ -169,7 +229,7 @@ def modo_interactivo(equipo_inicial=None, formacion_inicial=None):
     else:
         while True:
             print(f"Formaciones disponibles: {', '.join(opciones_formacion)}")
-            entrada_form = input("Elegí una formación [4-3-3]: ").strip()
+            entrada_form = leer_o_salir("Elegí una formación [4-3-3]: ")
             if not entrada_form:
                 formacion = "4-3-3"
                 break
@@ -187,16 +247,16 @@ def modo_interactivo(equipo_inicial=None, formacion_inicial=None):
         roles = obtener_roles_linea(formacion, codigo_linea, cantidad)
         print(f"--- Línea {codigo_linea} ---")
         for rol in roles:
-            nombre = input(f"  {rol}: ").strip()
+            nombre = leer_o_salir(f"  {rol}: ")
             jugadores.append(nombre if nombre else "Vacante")
         print()
 
-    cargar_suplentes = input("¿Querés cargar suplentes? (s/N): ").strip().lower()
+    cargar_suplentes = leer_o_salir("¿Querés cargar suplentes? (s/N): ").lower()
     if cargar_suplentes in ("s", "si", "sí", "y"):
         print("Escribí cada suplente y apretá Enter (Enter vacío para terminar):")
         idx = 1
         while True:
-            suplente = input(f"  Suplente {idx}: ").strip()
+            suplente = leer_o_salir(f"  Suplente {idx}: ")
             if not suplente:
                 break
             jugadores.append(suplente)
@@ -207,7 +267,6 @@ def modo_interactivo(equipo_inicial=None, formacion_inicial=None):
 
 def renderizar_sector(jugadores_linea, coords_linea, ancho):
     """Dibuja una línea de jugadores escalonada según posición y profundidad."""
-    # Agrupamos por nivel de profundidad (0 = más adelante hacia arco rival, mayor = más atrás).
     niveles = {}
     for jugador, (x_norm, prof) in zip(jugadores_linea, coords_linea):
         niveles.setdefault(prof, []).append((x_norm, str(jugador)))
@@ -301,29 +360,35 @@ def main():
     args = parser.parse_args()
     es_interactivo = False
 
-    if args.archivo:
-        with open(args.archivo, "r", encoding="utf-8") as f:
-            datos = json.load(f)
-        equipo = datos.get("equipo", args.equipo or "Mi Equipo")
-        formacion = datos.get("formacion", args.formacion or "4-3-3")
-        jugadores = datos.get("jugadores", [])
-    elif args.interactivo or not args.jugadores:
-        es_interactivo = True
-        equipo, formacion, jugadores = modo_interactivo(
-            equipo_inicial=args.equipo,
-            formacion_inicial=args.formacion,
-        )
-    else:
-        equipo = args.equipo or "Mi Equipo"
-        formacion = args.formacion or "4-3-3"
-        jugadores = args.jugadores
+    try:
+        if args.archivo:
+            with open(args.archivo, "r", encoding="utf-8") as f:
+                datos = json.load(f)
+            equipo = datos.get("equipo", args.equipo or "Mi Equipo")
+            formacion = datos.get("formacion", args.formacion or "4-3-3")
+            jugadores = datos.get("jugadores", [])
+        elif args.interactivo or not args.jugadores:
+            es_interactivo = True
+            equipo, formacion, jugadores = modo_interactivo(
+                equipo_inicial=args.equipo,
+                formacion_inicial=args.formacion,
+            )
+        else:
+            equipo = args.equipo or "Mi Equipo"
+            formacion = args.formacion or "4-3-3"
+            jugadores = args.jugadores
 
-    dibujar_cancha(equipo, formacion, jugadores)
+        dibujar_cancha(equipo, formacion, jugadores)
 
-    if es_interactivo:
-        guardar = input("\n¿Querés guardar esta alineación en JSON? (s/N): ").strip().lower()
-        if guardar in ("s", "si", "sí", "y"):
-            guardar_json(equipo, formacion, jugadores)
+        if es_interactivo:
+            guardar = leer_o_salir(
+                "\n¿Querés guardar esta alineación en JSON? (s/N): "
+            ).lower()
+            if guardar in ("s", "si", "sí", "y"):
+                guardar_json(equipo, formacion, jugadores)
+    except SalidaUsuario:
+        print("\nSaliste de la carga. ¡Hasta luego!")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
